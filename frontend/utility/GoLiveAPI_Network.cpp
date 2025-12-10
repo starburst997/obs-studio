@@ -9,6 +9,9 @@
 
 #include <QMessageBox>
 #include <QThreadPool>
+#include <QStandardPaths>
+#include <QFile>
+#include <QTextStream>
 #include <nlohmann/json.hpp>
 #include <qstring.h>
 
@@ -17,6 +20,87 @@
 using json = nlohmann::json;
 
 Qt::ConnectionType BlockingConnectionTypeFor(QObject *object);
+
+static uint32_t GetCustomBitrateOverride()
+{
+	QString documentsPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+	QString configPath = documentsPath + "/obs.cfg";
+
+	QFile configFile(configPath);
+	if (!configFile.exists()) {
+		blog(LOG_INFO, "Enhanced Broadcasting: obs.cfg not found at '%s', using default bitrate 8000",
+		     configPath.toUtf8().constData());
+		return 8000;
+	}
+
+	if (!configFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+		blog(LOG_WARNING, "Enhanced Broadcasting: Failed to open obs.cfg at '%s', using default bitrate 8000",
+		     configPath.toUtf8().constData());
+		return 8000;
+	}
+
+	QTextStream in(&configFile);
+	QString firstLine = in.readLine().trimmed();
+	configFile.close();
+
+	bool ok = false;
+	uint32_t bitrate = firstLine.toUInt(&ok);
+
+	if (!ok || bitrate == 0) {
+		blog(LOG_WARNING,
+		     "Enhanced Broadcasting: Invalid bitrate value '%s' in obs.cfg, using default bitrate 8000",
+		     firstLine.toUtf8().constData());
+		return 8000;
+	}
+
+	blog(LOG_INFO, "Enhanced Broadcasting: Using custom bitrate %u from obs.cfg", bitrate);
+	return bitrate;
+}
+
+static bool Is1080p60(const GoLiveApi::VideoEncoderConfiguration &encoder_config)
+{
+	// Check for 1080p resolution (1920x1080)
+	if (encoder_config.width != 1920 || encoder_config.height != 1080)
+		return false;
+
+	// Check for 60fps (framerate numerator/denominator = 60/1 or 60000/1001 for 59.94)
+	if (!encoder_config.framerate.has_value())
+		return false;
+
+	const auto &fps = encoder_config.framerate.value();
+	double framerate = static_cast<double>(fps.numerator) / static_cast<double>(fps.denominator);
+
+	// Allow for 59.94 (60000/1001) and 60fps
+	return framerate >= 59.0 && framerate <= 61.0;
+}
+
+static void ApplyCustomBitrateOverride(GoLiveApi::Config &config)
+{
+	uint32_t customBitrate = GetCustomBitrateOverride();
+
+	for (auto &encoder_config : config.encoder_configurations) {
+		if (!encoder_config.settings.contains("bitrate"))
+			continue;
+
+		uint32_t originalBitrate = encoder_config.settings["bitrate"].get<uint32_t>();
+
+		if (Is1080p60(encoder_config)) {
+			encoder_config.settings["bitrate"] = customBitrate;
+			blog(LOG_INFO,
+			     "Enhanced Broadcasting: Overriding 1080p60 bitrate: %u -> %u",
+			     originalBitrate, customBitrate);
+		} else {
+			double fps = 0.0;
+			if (encoder_config.framerate.has_value()) {
+				const auto &fr = encoder_config.framerate.value();
+				fps = static_cast<double>(fr.numerator) / static_cast<double>(fr.denominator);
+			}
+			blog(LOG_INFO,
+			     "Enhanced Broadcasting: Keeping original bitrate %u for encoder (width=%u, height=%u, fps=%.2f)",
+			     originalBitrate, encoder_config.width, encoder_config.height, fps);
+		}
+	}
+}
 
 void HandleGoLiveApiErrors(QWidget *parent, const json &raw_json, const GoLiveApi::Config &config)
 {
@@ -97,6 +181,7 @@ GoLiveApi::Config DownloadGoLiveConfig(QWidget *parent, QString url, const GoLiv
 		blog(LOG_INFO, "Go live response data: %s", censoredJson(data, true).toUtf8().constData());
 		GoLiveApi::Config config = data;
 		HandleGoLiveApiErrors(parent, data, config);
+		ApplyCustomBitrateOverride(config);
 		return config;
 
 	} catch (const json::exception &e) {
